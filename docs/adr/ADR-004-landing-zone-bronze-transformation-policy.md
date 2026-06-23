@@ -1,7 +1,7 @@
 # ADR-004: Landing Zone, Camada Bronze e Política de Transformação
 
 **Status:** Aprovado  
-**Data:** 2025-04  
+**Data:** 2026-04  
 **Decisores:** Equipe SwiftLogix Data Platform  
 
 ---

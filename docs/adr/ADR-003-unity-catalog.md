@@ -1,7 +1,7 @@
 # ADR-003: Catálogo de Dados — Unity Catalog
 
 **Status:** Proposto (aguardando confirmação)  
-**Data:** 2025-04  
+**Data:** 2026-04  
 **Decisores:** Equipe SwiftLogix Data Platform  
 
 ---

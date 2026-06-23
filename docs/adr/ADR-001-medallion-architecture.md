@@ -1,7 +1,7 @@
 # ADR-001: Arquitetura Medallion e Stack de Processamento
 
 **Status:** Proposto  
-**Data:** 2025-04  
+**Data:** 2026-04  
 **Decisores:** Equipe SwiftLogix Data Platform  
 
 ---
@@ -28,15 +28,15 @@ Adotar arquitetura **Medallion (Bronze → Silver → Gold)** sobre **Delta Lake
 
 ### Camadas
 
-| Camada | Propósito | Formato | Retenção |
-|--------|-----------|---------|----------|
-| **Bronze** | Ingestão raw, sem transformação de negócio | Delta (schema-on-read com schema hints) | 1 ano |
-| **Silver** | Dados limpos, validados, enriquecidos, deduplicados | Delta | 1 ano |
-| **Gold** | Agregações e modelos de leitura para consumidores | Delta | 90 dias (hot) + 1 ano (cold) |
+| Camada | Propósito | Formato |
+|--------|-----------|---------|
+| **Bronze** | Ingestão raw, sem transformação de negócio | Delta (schema-on-read com schema hints) |
+| **Silver** | Dados limpos, validados, enriquecidos, deduplicados | Delta |
+| **Gold** | Agregações e modelos de leitura para consumidores | Delta |
 
 ### Modelo de Processamento
 
-**Micro-batch com `trigger(availableNow=True)`** para os pipelines Bronze → Silver e Silver → Gold:
+**Micro-batch com `trigger(availableNow=True)`** para os pipelines Landing →Bronze, Bronze → Silver e Silver → Gold:
 - Executa a cada 15 minutos via job schedule no Databricks
 - Processa exatamente o que chegou desde a última execução (watermark por `ingestion_timestamp`)
 - Comporta-se como batch: idempotente, re-executável, sem estado de streaming de longa duração

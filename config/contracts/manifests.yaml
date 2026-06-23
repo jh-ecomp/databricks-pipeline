@@ -1,0 +1,351 @@
+version: "1.0.0"
+last_updated: "2026-04"
+
+# =============================================================================
+# NOTA: Este arquivo é a representação local do contrato registrado no
+# Unity Catalog (swiftlogix_bronze.transactional — Table Properties + Schema).
+# O código de produção SEMPRE lê o contrato a partir do Unity Catalog.
+# Este arquivo serve como fonte para o registro inicial e para revisão via Git.
+# =============================================================================
+
+contract:
+  id: "swiftlogix.transactional.manifests"
+  display_name: "Dispatch Manifests"
+  description: >
+    Documento de despacho que agrupa shipments em uma saída de veículo.
+    Relação 1:1 entre veículo e manifest por despacho.
+    Soft-delete: registros nunca são fisicamente removidos; deleted_at é
+    preenchido quando o manifest é logicamente excluído.
+  source:
+    type: "rds_replica"
+    system: "operational_db"
+    table: "public.manifests"
+    credentials_secret: "swiftlogix/rds/replica/credentials"  # AWS Secrets Manager
+  owner:
+    team: "logistics-data"
+    contact: "logistics-data@swiftlogix.com"
+    escalation: "data-platform@swiftlogix.com"
+  consumers:
+    - id: "silver.logistics.shipment_events_enriched"
+      sla: "D-1"
+    - id: "gold.serving.financial_reconciliation"
+      sla: "D-1"
+    - id: "gold.serving.ops_dashboard"
+      sla: "D-1"
+  criticality: "HIGH"
+  breaking_change_policy: "QUARANTINE_AND_ALERT"
+
+# =============================================================================
+# SCHEMA
+# Tipos seguem a convenção Spark/Delta.
+# nullable: false implica que a ausência do campo é tratada como MISSING_FIELD
+# (breaking change) e envia o registro para quarentena.
+# =============================================================================
+
+schema:
+  fields:
+
+    # -------------------------------------------------------------------------
+    # Identidade
+    # -------------------------------------------------------------------------
+    - name: "manifest_id"
+      type: "STRING"
+      nullable: false
+      primary_key: true
+      description: "Identificador único do manifest, gerado pelo sistema operacional."
+      example: "MNF-2026-00183742"
+
+    # -------------------------------------------------------------------------
+    # Veículo e rota
+    # -------------------------------------------------------------------------
+    - name: "vehicle_id"
+      type: "STRING"
+      nullable: false
+      description: "Identificador do veículo despachado. Relação 1:1 por despacho."
+      example: "V-1042"
+      foreign_key: "operational_db.fleet.vehicle_id"
+
+    - name: "route_id"
+      type: "STRING"
+      nullable: false
+      description: "Identificador da rota planejada para este despacho."
+      example: "RTE-SP-042"
+
+    - name: "driver_id"
+      type: "STRING"
+      nullable: false
+      description: "Identificador do motorista responsável pelo despacho."
+      example: "DRV-00571"
+
+    # -------------------------------------------------------------------------
+    # Centro de triagem e localização
+    # -------------------------------------------------------------------------
+    - name: "sorting_center_id"
+      type: "STRING"
+      nullable: false
+      description: "Centro de triagem de origem do despacho."
+      example: "SC-BR-001"
+      foreign_key: "operational_db.sorting_centers.sorting_center_id"
+
+    - name: "country_code"
+      type: "STRING"
+      nullable: false
+      description: "País de operação do despacho. ISO 3166-1 alpha-2."
+      example: "BR"
+      constraints:
+        allowed_values: ["BR", "AR"]
+
+    # -------------------------------------------------------------------------
+    # Temporalidade
+    # -------------------------------------------------------------------------
+    - name: "dispatch_timestamp"
+      type: "TIMESTAMP"
+      nullable: false
+      description: "Momento em que o veículo saiu do centro de triagem."
+      example: "2026-04-10T06:30:00Z"
+
+    - name: "expected_return_timestamp"
+      type: "TIMESTAMP"
+      nullable: true
+      description: >
+        Estimativa de retorno do veículo ao centro de triagem.
+        Pode ser nulo em rotas de longa distância sem retorno programado.
+      example: "2026-04-10T18:00:00Z"
+
+    # -------------------------------------------------------------------------
+    # Carga
+    # -------------------------------------------------------------------------
+    - name: "shipment_count"
+      type: "INTEGER"
+      nullable: false
+      description: "Número de shipments incluídos no manifest."
+      example: 47
+      constraints:
+        min: 1
+
+    - name: "total_weight_kg"
+      type: "DOUBLE"
+      nullable: false
+      description: "Peso total da carga despachada em quilogramas."
+      example: 312.5
+      constraints:
+        min: 0.001
+
+    - name: "cold_chain_required"
+      type: "BOOLEAN"
+      nullable: false
+      description: >
+        Indica se ao menos um shipment no manifest requer cadeia de frio.
+        Quando True, o veículo deve manter temperatura controlada durante todo o despacho.
+      example: false
+
+    # -------------------------------------------------------------------------
+    # Status
+    # -------------------------------------------------------------------------
+    - name: "status"
+      type: "STRING"
+      nullable: false
+      description: "Estado atual do manifest no ciclo de vida do despacho."
+      example: "DISPATCHED"
+      constraints:
+        allowed_values:
+          - "PLANNED"       # Manifest criado, veículo ainda não saiu
+          - "DISPATCHED"    # Veículo saiu do centro de triagem
+          - "IN_TRANSIT"    # Em rota de entrega
+          - "COMPLETED"     # Todas as entregas concluídas, veículo retornou
+          - "CANCELLED"     # Manifest cancelado antes ou durante o despacho
+
+    # -------------------------------------------------------------------------
+    # Financeiro
+    # -------------------------------------------------------------------------
+    - name: "cargo_declared_value"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: >
+        Valor total declarado da carga, agregado dos shipments.
+        Usado como base de cálculo para seguro e responsabilidade civil.
+      example: 15200.00
+
+    - name: "currency_code"
+      type: "STRING"
+      nullable: false
+      description: "Moeda do valor declarado. ISO 4217."
+      example: "BRL"
+      constraints:
+        allowed_values: ["BRL", "ARS"]
+
+    - name: "total_freight_charge"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: >
+        Tarifa total de frete cobrada pelos shipments do manifest.
+        Base para o relatório de conciliação financeira.
+      example: 890.50
+
+    - name: "total_tax_amount"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: >
+        Total de impostos incidentes sobre o frete do manifest (ex: ICMS, ISS no Brasil).
+        Detalhamento por imposto fica nos registros de shipment individuais.
+      example: 160.29
+
+    - name: "total_insurance_fee"
+      type: "DECIMAL(18,2)"
+      nullable: true
+      description: >
+        Taxa de seguro da carga para o manifest. Nulo quando não contratado.
+      example: 45.60
+
+    # -------------------------------------------------------------------------
+    # Auditoria e controle
+    # -------------------------------------------------------------------------
+    - name: "created_at"
+      type: "TIMESTAMP"
+      nullable: false
+      description: "Timestamp de criação do registro no sistema operacional."
+      example: "2026-04-10T05:15:00Z"
+
+    - name: "updated_at"
+      type: "TIMESTAMP"
+      nullable: false
+      description: >
+        Timestamp da última atualização do registro. Usado como watermark
+        para a extração incremental da Bronze. Toda alteração no registro
+        deve atualizar este campo.
+      example: "2026-04-10T06:31:00Z"
+      watermark: true
+
+    - name: "deleted_at"
+      type: "TIMESTAMP"
+      nullable: true
+      description: >
+        Soft-delete: nulo para registros ativos. Preenchido com o timestamp
+        da exclusão lógica quando o manifest é removido. Registros com
+        deleted_at preenchido devem ser propagados para Silver e tratados
+        como deleções lógicas — nunca fisicamente removidos da Bronze.
+      example: null
+
+# =============================================================================
+# QUALIDADE DE DADOS
+# Regras avaliadas na camada Silver (Great Expectations).
+# A Bronze registra os dados como vieram; a Silver valida a integridade.
+# =============================================================================
+
+quality_rules:
+  - id: "QR-MNF-001"
+    field: "manifest_id"
+    rule: "not_null_and_unique"
+    severity: "CRITICAL"
+    description: "manifest_id deve ser único e não nulo em toda a tabela Silver."
+
+  - id: "QR-MNF-002"
+    field: "dispatch_timestamp"
+    rule: "not_null"
+    severity: "CRITICAL"
+    description: "Todo manifest despachado deve ter timestamp de despacho."
+
+  - id: "QR-MNF-003"
+    field: "dispatch_timestamp"
+    rule: "not_future"
+    severity: "HIGH"
+    description: "dispatch_timestamp não pode ser posterior ao ingestion_timestamp da Bronze."
+
+  - id: "QR-MNF-004"
+    field: "expected_return_timestamp"
+    rule: "after_field"
+    reference_field: "dispatch_timestamp"
+    severity: "HIGH"
+    description: "expected_return_timestamp deve ser posterior a dispatch_timestamp quando preenchido."
+
+  - id: "QR-MNF-005"
+    field: "shipment_count"
+    rule: "min_value"
+    value: 1
+    severity: "HIGH"
+    description: "Um manifest deve conter ao menos 1 shipment."
+
+  - id: "QR-MNF-006"
+    field: "total_weight_kg"
+    rule: "min_value"
+    value: 0.001
+    severity: "HIGH"
+    description: "Peso total deve ser positivo."
+
+  - id: "QR-MNF-007"
+    field: "status"
+    rule: "allowed_values"
+    values: ["PLANNED", "DISPATCHED", "IN_TRANSIT", "COMPLETED", "CANCELLED"]
+    severity: "CRITICAL"
+    description: "Status deve ser um dos valores permitidos."
+
+  - id: "QR-MNF-008"
+    field: "country_code"
+    rule: "allowed_values"
+    values: ["BR", "AR"]
+    severity: "HIGH"
+    description: "country_code deve ser um dos países de operação da SwiftLogix."
+
+  - id: "QR-MNF-009"
+    field: "currency_code"
+    rule: "allowed_values"
+    values: ["BRL", "ARS"]
+    severity: "HIGH"
+    description: "currency_code deve corresponder ao país de operação."
+
+  - id: "QR-MNF-010"
+    field: "cargo_declared_value"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Valor declarado não pode ser negativo."
+
+  - id: "QR-MNF-011"
+    field: "total_freight_charge"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Tarifa de frete não pode ser negativa."
+
+  - id: "QR-MNF-012"
+    field: "total_tax_amount"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Total de impostos não pode ser negativo."
+
+  - id: "QR-MNF-013"
+    fields: ["country_code", "currency_code"]
+    rule: "conditional_match"
+    condition: "country_code == 'BR' => currency_code == 'BRL'"
+    severity: "HIGH"
+    description: "Manifests brasileiros devem usar BRL; argentinos devem usar ARS."
+
+  - id: "QR-MNF-014"
+    field: "updated_at"
+    rule: "after_or_equal_field"
+    reference_field: "created_at"
+    severity: "CRITICAL"
+    description: "updated_at não pode ser anterior a created_at."
+
+  - id: "QR-MNF-015"
+    field: "deleted_at"
+    rule: "after_or_equal_field"
+    reference_field: "created_at"
+    condition: "deleted_at is not null"
+    severity: "HIGH"
+    description: "deleted_at quando preenchido deve ser posterior a created_at."
+
+# =============================================================================
+# POLÍTICA DE EVOLUÇÃO DE SCHEMA
+# =============================================================================
+
+schema_evolution:
+  allow_new_nullable_fields: true       # Warning + schema_drift_detected = True
+  allow_new_required_fields: false      # Quarentena imediata
+  allow_field_removal: false            # Quarentena imediata
+  allow_field_rename: false             # Quarentena imediata
+  allow_type_widening: true             # Ex: INT → LONG é aceito
+  allow_type_narrowing: false           # Quarentena imediata
+  on_breaking_change: "QUARANTINE_AND_ALERT_CRITICAL"
+  on_non_breaking_change: "ACCEPT_AND_ALERT_WARNING"

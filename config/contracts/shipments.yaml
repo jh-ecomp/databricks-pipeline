@@ -1,0 +1,491 @@
+version: "1.0.0"
+last_updated: "2025-04"
+
+# =============================================================================
+# NOTA: Este arquivo é a representação local do contrato registrado no
+# Unity Catalog (swiftlogix_bronze.transactional — Table Properties + Schema).
+# O código de produção SEMPRE lê o contrato a partir do Unity Catalog.
+# Este arquivo serve como fonte para o registro inicial e para revisão via Git.
+# =============================================================================
+
+contract:
+  id: "swiftlogix.transactional.shipments"
+  display_name: "Shipments"
+  description: >
+    Unidade individual de entrega — um pacote ou conjunto de volumes com um
+    remetente, um destinatário, uma janela de entrega e um conjunto de itens.
+    Associado a um manifest para despacho (N shipments : 1 manifest).
+    Soft-delete: registros nunca são fisicamente removidos; deleted_at é
+    preenchido quando o shipment é logicamente excluído.
+    Itens do shipment são armazenados como ARRAY<STRUCT> na Bronze;
+    a explosão em linhas individuais ocorre na Silver quando necessário.
+  source:
+    type: "rds_replica"
+    system: "operational_db"
+    table: "public.shipments"
+    credentials_secret: "swiftlogix/rds/replica/credentials"  # AWS Secrets Manager
+  owner:
+    team: "logistics-data"
+    contact: "logistics-data@swiftlogix.com"
+    escalation: "data-platform@swiftlogix.com"
+  consumers:
+    - id: "silver.logistics.shipment_events_enriched"
+      sla: "D-1"
+    - id: "gold.serving.financial_reconciliation"
+      sla: "D-1"
+    - id: "gold.serving.ops_dashboard"
+      sla: "D-1"
+    - id: "gold.serving.eta_features"
+      sla: "D-1"
+  criticality: "HIGH"
+  breaking_change_policy: "QUARANTINE_AND_ALERT"
+
+# =============================================================================
+# SCHEMA
+# Tipos seguem a convenção Spark/Delta.
+# nullable: false implica que a ausência do campo é tratada como MISSING_FIELD
+# (breaking change) e envia o registro para quarentena.
+#
+# DECISÃO DE FLATTEN:
+# Campos escalares aninhados são achatados com separador duplo underscore (__).
+# Exemplo: delivery_window.start → delivery_window__start
+# O array de itens (items[]) é preservado como ARRAY<STRUCT<...>> na Bronze.
+# Achatar arrays de tamanho variável geraria colunas posicionais frágeis
+# (items__0__description, items__1__description...) — antipadrão evitado
+# intencionalmente. A explosão em linhas ocorre na Silver via EXPLODE().
+# =============================================================================
+
+schema:
+  fields:
+
+    # -------------------------------------------------------------------------
+    # Identidade
+    # -------------------------------------------------------------------------
+    - name: "shipment_id"
+      type: "STRING"
+      nullable: false
+      primary_key: true
+      description: "Identificador único do shipment, gerado pelo sistema operacional."
+      example: "SHP-2025-00847291"
+
+    - name: "tracking_code"
+      type: "STRING"
+      nullable: false
+      description: >
+        Código de rastreamento público do shipment, exposto ao remetente e destinatário.
+        Distinto do shipment_id interno.
+      example: "SWL20250410BR001"
+
+    # -------------------------------------------------------------------------
+    # Relacionamentos
+    # -------------------------------------------------------------------------
+    - name: "manifest_id"
+      type: "STRING"
+      nullable: true
+      description: >
+        FK para o manifest de despacho. Nulo quando o shipment ainda não foi
+        alocado a um manifest (status CREATED ou PENDING_PICKUP).
+      example: "MNF-2025-00183742"
+      foreign_key: "operational_db.manifests.manifest_id"
+
+    - name: "sender_id"
+      type: "STRING"
+      nullable: false
+      description: "FK para a tabela de entidades (remetente). Endereço resolvido na Silver."
+      example: "ENT-00012841"
+      foreign_key: "operational_db.entities.entity_id"
+
+    - name: "recipient_id"
+      type: "STRING"
+      nullable: false
+      description: "FK para a tabela de entidades (destinatário). Endereço resolvido na Silver."
+      example: "ENT-00097523"
+      foreign_key: "operational_db.entities.entity_id"
+
+    - name: "sorting_center_origin_id"
+      type: "STRING"
+      nullable: false
+      description: "Centro de triagem onde o shipment foi coletado ou entrou na rede."
+      example: "SC-BR-001"
+      foreign_key: "operational_db.sorting_centers.sorting_center_id"
+
+    - name: "sorting_center_destination_id"
+      type: "STRING"
+      nullable: true
+      description: >
+        Centro de triagem de destino final. Nulo em entregas diretas sem
+        passagem por centro intermediário.
+      example: "SC-BR-003"
+      foreign_key: "operational_db.sorting_centers.sorting_center_id"
+
+    # -------------------------------------------------------------------------
+    # Janela de entrega
+    # ATENÇÃO: este grupo de campos foi o epicentro do incidente de schema drift
+    # (delivery_window.start → delivery.window_start) que causou 11 dias de
+    # dados corrompidos. Qualquer alteração neste grupo deve acionar revisão
+    # obrigatória do contrato antes do deploy em produção.
+    # -------------------------------------------------------------------------
+    - name: "delivery_window__start"
+      type: "TIMESTAMP"
+      nullable: false
+      description: >
+        Início da janela de entrega acordada com o destinatário.
+        CAMPO CRÍTICO: histórico de breaking change — ver nota no grupo acima.
+      example: "2025-04-10T08:00:00Z"
+
+    - name: "delivery_window__end"
+      type: "TIMESTAMP"
+      nullable: false
+      description: "Fim da janela de entrega acordada com o destinatário."
+      example: "2025-04-10T12:00:00Z"
+
+    - name: "delivery_window__timezone"
+      type: "STRING"
+      nullable: false
+      description: "Timezone da janela de entrega. IANA timezone format."
+      example: "America/Sao_Paulo"
+
+    # -------------------------------------------------------------------------
+    # Status e ciclo de vida
+    # -------------------------------------------------------------------------
+    - name: "status"
+      type: "STRING"
+      nullable: false
+      description: "Estado atual do shipment no ciclo de vida de entrega."
+      example: "IN_TRANSIT"
+      constraints:
+        allowed_values:
+          - "CREATED"           # Shipment registrado, aguardando coleta
+          - "PENDING_PICKUP"    # Coleta agendada
+          - "COLLECTED"         # Coletado pelo veículo
+          - "IN_TRANSIT"        # Em rota de entrega
+          - "AT_SORTING_CENTER" # Em centro de triagem intermediário
+          - "OUT_FOR_DELIVERY"  # Saiu para entrega final
+          - "DELIVERED"         # Entregue ao destinatário
+          - "EXCEPTION"         # Ocorreu uma exceção (endereço inválido, ausência, dano)
+          - "RETURNED"          # Devolvido ao remetente
+          - "CANCELLED"         # Cancelado antes da coleta
+
+    - name: "exception_reason"
+      type: "STRING"
+      nullable: true
+      description: >
+        Motivo da exceção quando status = EXCEPTION. Nulo para todos os outros status.
+      example: "RECIPIENT_ABSENT"
+      constraints:
+        allowed_values:
+          - "RECIPIENT_ABSENT"
+          - "INVALID_ADDRESS"
+          - "DAMAGED_PACKAGE"
+          - "REFUSED_BY_RECIPIENT"
+          - "ACCESS_DENIED"
+          - "OTHER"
+
+    # -------------------------------------------------------------------------
+    # Características físicas
+    # -------------------------------------------------------------------------
+    - name: "total_weight_kg"
+      type: "DOUBLE"
+      nullable: false
+      description: "Peso total do shipment em quilogramas."
+      example: 4.75
+      constraints:
+        min: 0.001
+
+    - name: "total_volume_m3"
+      type: "DOUBLE"
+      nullable: true
+      description: "Volume total do shipment em metros cúbicos. Nulo quando não mensurado."
+      example: 0.032
+
+    - name: "cold_chain_required"
+      type: "BOOLEAN"
+      nullable: false
+      description: "Indica se o shipment requer transporte em cadeia de frio."
+      example: false
+
+    - name: "cold_chain__min_temp_celsius"
+      type: "DOUBLE"
+      nullable: true
+      description: >
+        Temperatura mínima permitida durante o transporte (cadeia de frio).
+        Nulo quando cold_chain_required = False.
+      example: -8.0
+
+    - name: "cold_chain__max_temp_celsius"
+      type: "DOUBLE"
+      nullable: true
+      description: >
+        Temperatura máxima permitida durante o transporte (cadeia de frio).
+        Nulo quando cold_chain_required = False.
+      example: 2.0
+
+    # -------------------------------------------------------------------------
+    # Localização
+    # -------------------------------------------------------------------------
+    - name: "country_code"
+      type: "STRING"
+      nullable: false
+      description: "País de destino da entrega. ISO 3166-1 alpha-2."
+      example: "BR"
+      constraints:
+        allowed_values: ["BR", "AR"]
+
+    # -------------------------------------------------------------------------
+    # Itens do shipment
+    # DECISÃO: armazenado como ARRAY<STRUCT> na Bronze.
+    # Não é achatado — achatar arrays de tamanho variável geraria colunas
+    # posicionais frágeis. A explosão ocorre na Silver via EXPLODE().
+    # -------------------------------------------------------------------------
+    - name: "items"
+      type: "ARRAY<STRUCT<description:STRING, quantity:INTEGER, unit:STRING, unit_price:DECIMAL(18,2), subtotal:DECIMAL(18,2)>>"
+      nullable: false
+      description: >
+        Lista de itens que compõem o shipment.
+        Cada item contém: description (descrição do produto), quantity (quantidade),
+        unit (unidade de medida: UN, KG, CX, L), unit_price (preço unitário),
+        subtotal (quantity * unit_price — redundante mas preservado do sistema de origem).
+      example: >
+        [
+          {"description": "Notebook Dell XPS", "quantity": 1, "unit": "UN", "unit_price": 7500.00, "subtotal": 7500.00},
+          {"description": "Fonte de alimentação", "quantity": 1, "unit": "UN", "unit_price": 250.00, "subtotal": 250.00}
+        ]
+      constraints:
+        min_items: 1
+
+    # -------------------------------------------------------------------------
+    # Financeiro
+    # DECISÃO: campos financeiros mantidos no nível do shipment individual.
+    # Os totais no manifest são agregações destes campos e são redundantes
+    # por design — simplificam a camada Gold (financial_reconciliation)
+    # evitando agregações em tempo de query. A consistência entre o shipment
+    # e o manifest deve ser validada na Silver.
+    # -------------------------------------------------------------------------
+    - name: "declared_value"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: >
+        Valor declarado da mercadoria. Base para cálculo de seguro e
+        responsabilidade civil em caso de dano ou extravio.
+      example: 7750.00
+      constraints:
+        min: 0
+
+    - name: "freight_charge"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: "Tarifa de frete do shipment individual. Compõe total_freight_charge do manifest."
+      example: 38.90
+      constraints:
+        min: 0
+
+    - name: "tax_amount"
+      type: "DECIMAL(18,2)"
+      nullable: false
+      description: >
+        Total de impostos incidentes sobre o frete deste shipment.
+        Compõe total_tax_amount do manifest.
+      example: 7.00
+      constraints:
+        min: 0
+
+    - name: "insurance_fee"
+      type: "DECIMAL(18,2)"
+      nullable: true
+      description: >
+        Taxa de seguro da carga para este shipment. Nulo quando não contratado.
+        Compõe total_insurance_fee do manifest.
+      example: 19.37
+
+    - name: "currency_code"
+      type: "STRING"
+      nullable: false
+      description: "Moeda dos valores financeiros. ISO 4217."
+      example: "BRL"
+      constraints:
+        allowed_values: ["BRL", "ARS"]
+
+    # -------------------------------------------------------------------------
+    # Auditoria e controle
+    # -------------------------------------------------------------------------
+    - name: "created_at"
+      type: "TIMESTAMP"
+      nullable: false
+      description: "Timestamp de criação do registro no sistema operacional."
+      example: "2025-04-09T14:22:00Z"
+
+    - name: "updated_at"
+      type: "TIMESTAMP"
+      nullable: false
+      description: >
+        Timestamp da última atualização do registro. Usado como watermark
+        para a extração incremental da Bronze. Toda alteração no registro
+        deve atualizar este campo.
+      example: "2025-04-10T06:31:00Z"
+      watermark: true
+
+    - name: "deleted_at"
+      type: "TIMESTAMP"
+      nullable: true
+      description: >
+        Soft-delete: nulo para registros ativos. Preenchido com o timestamp
+        da exclusão lógica quando o shipment é removido. Registros com
+        deleted_at preenchido devem ser propagados para Silver e tratados
+        como deleções lógicas — nunca fisicamente removidos da Bronze.
+      example: null
+
+# =============================================================================
+# QUALIDADE DE DADOS
+# Regras avaliadas na camada Silver (Great Expectations).
+# =============================================================================
+
+quality_rules:
+  - id: "QR-SHP-001"
+    field: "shipment_id"
+    rule: "not_null_and_unique"
+    severity: "CRITICAL"
+    description: "shipment_id deve ser único e não nulo em toda a tabela Silver."
+
+  - id: "QR-SHP-002"
+    field: "tracking_code"
+    rule: "not_null_and_unique"
+    severity: "CRITICAL"
+    description: "tracking_code deve ser único — é o identificador público do shipment."
+
+  - id: "QR-SHP-003"
+    field: "delivery_window__start"
+    rule: "not_null"
+    severity: "CRITICAL"
+    description: >
+      delivery_window__start é obrigatório. Campo com histórico de breaking change —
+      ausência deve acionar alerta imediato além da quarentena padrão.
+
+  - id: "QR-SHP-004"
+    field: "delivery_window__end"
+    rule: "after_field"
+    reference_field: "delivery_window__start"
+    severity: "CRITICAL"
+    description: "delivery_window__end deve ser posterior a delivery_window__start."
+
+  - id: "QR-SHP-005"
+    field: "status"
+    rule: "allowed_values"
+    values: ["CREATED", "PENDING_PICKUP", "COLLECTED", "IN_TRANSIT", "AT_SORTING_CENTER",
+             "OUT_FOR_DELIVERY", "DELIVERED", "EXCEPTION", "RETURNED", "CANCELLED"]
+    severity: "CRITICAL"
+    description: "Status deve ser um dos valores permitidos no ciclo de vida."
+
+  - id: "QR-SHP-006"
+    fields: ["status", "exception_reason"]
+    rule: "conditional_not_null"
+    condition: "status == 'EXCEPTION' => exception_reason is not null"
+    severity: "HIGH"
+    description: "exception_reason é obrigatório quando status = EXCEPTION."
+
+  - id: "QR-SHP-007"
+    fields: ["cold_chain_required", "cold_chain__min_temp_celsius", "cold_chain__max_temp_celsius"]
+    rule: "conditional_not_null"
+    condition: "cold_chain_required == True => cold_chain__min_temp_celsius is not null AND cold_chain__max_temp_celsius is not null"
+    severity: "HIGH"
+    description: "Limites de temperatura são obrigatórios quando cold_chain_required = True."
+
+  - id: "QR-SHP-008"
+    fields: ["cold_chain__min_temp_celsius", "cold_chain__max_temp_celsius"]
+    rule: "min_less_than_max"
+    condition: "cold_chain_required == True"
+    severity: "HIGH"
+    description: "cold_chain__min_temp_celsius deve ser menor que cold_chain__max_temp_celsius."
+
+  - id: "QR-SHP-009"
+    field: "items"
+    rule: "array_min_size"
+    value: 1
+    severity: "CRITICAL"
+    description: "Todo shipment deve conter ao menos 1 item."
+
+  - id: "QR-SHP-010"
+    field: "items"
+    rule: "array_struct_field_not_null"
+    struct_fields: ["description", "quantity", "unit_price", "subtotal"]
+    severity: "HIGH"
+    description: "Todos os campos obrigatórios de cada item devem estar presentes e não nulos."
+
+  - id: "QR-SHP-011"
+    field: "items"
+    rule: "array_struct_subtotal_consistency"
+    condition: "subtotal == quantity * unit_price"
+    severity: "HIGH"
+    description: "subtotal de cada item deve ser consistente com quantity * unit_price."
+
+  - id: "QR-SHP-012"
+    field: "declared_value"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Valor declarado não pode ser negativo."
+
+  - id: "QR-SHP-013"
+    field: "freight_charge"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Tarifa de frete não pode ser negativa."
+
+  - id: "QR-SHP-014"
+    field: "tax_amount"
+    rule: "min_value"
+    value: 0
+    severity: "HIGH"
+    description: "Total de impostos não pode ser negativo."
+
+  - id: "QR-SHP-015"
+    fields: ["country_code", "currency_code"]
+    rule: "conditional_match"
+    condition: "country_code == 'BR' => currency_code == 'BRL'"
+    severity: "HIGH"
+    description: "Shipments brasileiros devem usar BRL; argentinos devem usar ARS."
+
+  - id: "QR-SHP-016"
+    field: "updated_at"
+    rule: "after_or_equal_field"
+    reference_field: "created_at"
+    severity: "CRITICAL"
+    description: "updated_at não pode ser anterior a created_at."
+
+  - id: "QR-SHP-017"
+    field: "manifest_id"
+    rule: "referential_integrity"
+    reference_table: "swiftlogix_bronze.transactional.manifests"
+    reference_field: "manifest_id"
+    condition: "manifest_id is not null"
+    severity: "HIGH"
+    description: "manifest_id quando preenchido deve existir na tabela de manifests."
+    evaluation_layer: "SILVER"
+    note: >
+      Avaliado na Silver após ambas as tabelas estarem disponíveis.
+      Violações podem ocorrer legitimamente por latência de ingestão entre
+      as duas tabelas — tratar como WARNING, não CRITICAL.
+
+# =============================================================================
+# POLÍTICA DE EVOLUÇÃO DE SCHEMA
+# =============================================================================
+
+schema_evolution:
+  allow_new_nullable_fields: true
+  allow_new_required_fields: false
+  allow_field_removal: false
+  allow_field_rename: false
+  allow_type_widening: true
+  allow_type_narrowing: false
+  on_breaking_change: "QUARANTINE_AND_ALERT_CRITICAL"
+  on_non_breaking_change: "ACCEPT_AND_ALERT_WARNING"
+  high_sensitivity_fields:
+    - field: "delivery_window__start"
+      note: >
+        Campo com histórico de breaking change que causou incidente de US$ 480k.
+        Qualquer drift neste campo deve acionar alerta com severidade CRITICAL
+        independentemente do tipo de mudança (breaking ou não).
+    - field: "delivery_window__end"
+      note: "Mesmo grupo crítico que delivery_window__start."
+    - field: "delivery_window__timezone"
+      note: "Mesmo grupo crítico que delivery_window__start."

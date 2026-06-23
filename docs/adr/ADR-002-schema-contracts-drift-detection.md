@@ -1,7 +1,7 @@
 # ADR-002: Contratos de Dados e Detecção de Schema Drift
 
 **Status:** Proposto  
-**Data:** 2025-04  
+**Data:** 2026-04  
 **Decisores:** Equipe SwiftLogix Data Platform  
 
 ---

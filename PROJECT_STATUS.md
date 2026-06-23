@@ -59,5 +59,6 @@ DB Réplica (transac.) ──► bronze.shipments     ──►                 
 
 | Sessão | Data | O que foi feito |
 |--------|------|-----------------|
-| 01 | 2025-04 | Estrutura do repositório criada, ADRs 001-003 rascunhados, decisões abertas levantadas |
-| 02 | 2025-04 | ADR-004 aprovado (Landing Zone vs Bronze, flatten na Bronze, política de transformação). BDD features da Bronze criados para as 3 fontes: telemetria S3, scans de triagem S3, transacional DB réplica |
+| 01 | 2026-06 | Estrutura do repositório criada, ADRs 001-003 rascunhados, decisões abertas levantadas |
+| 02 | 2026-06 | ADR-004 aprovado (Landing Zone vs Bronze, flatten na Bronze, política de transformação). BDD features da Bronze criados para as 3 fontes: telemetria S3, scans de triagem S3, transacional DB réplica |
+| 03 | 2026-06 | Contratos de dados criados e validados: manifests.yaml e shipments.yaml. Próxima sessão: vehicle_telemetry.yaml → sorting_center_scans.yaml → step definitions Bronze
